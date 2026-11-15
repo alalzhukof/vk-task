@@ -1,0 +1,8 @@
+.env
+.git
+.build
+backups
+evidence
+deliverables
+**/__pycache__
+.venv

@@ -1,0 +1,298 @@
+name: securedesk
+x-app: &app
+  build:
+    context: .
+    target: runtime
+  image: securedesk-app:local
+  read_only: true
+  tmpfs: [/tmp]
+  cap_drop: [ALL]
+  security_opt: [no-new-privileges:true]
+  restart: unless-stopped
+x-rabbit: &rabbit
+  image: rabbitmq:4.1-management-alpine@sha256:42c6214e0e2093caa2484718faacb733631cc9ddc869b3298397613237dbea4a
+  environment: &rabbit-env
+    RABBITMQ_DEFAULT_USER: desk
+    RABBITMQ_SERVER_ADDITIONAL_ERL_ARGS: '+S 2:2'
+  entrypoint: [sh, /securedesk-rabbit.sh]
+  depends_on:
+    init: {condition: service_completed_successfully}
+  volumes: [./infra/rabbitmq/rabbitmq.conf:/etc/rabbitmq/rabbitmq.conf:ro]
+  healthcheck:
+    test: [CMD-SHELL, 'HOME=/var/lib/rabbitmq rabbitmq-diagnostics -q check_running']
+    interval: 5s
+    timeout: 5s
+    retries: 30
+  restart: unless-stopped
+  mem_limit: 600m
+services:
+  init:
+    build: {context: ., target: runtime}
+    image: securedesk-app:local
+    user: '0:0'
+    command: [/usr/local/bin/init]
+    network_mode: none
+    read_only: true
+    environment:
+      # Optional one-time migration from the previous .env. Fresh installs need no file.
+      PG_PASSWORD: ${PG_PASSWORD:-}
+      API_DB_PASSWORD: ${API_DB_PASSWORD:-}
+      WORKER_DB_PASSWORD: ${WORKER_DB_PASSWORD:-}
+      REPL_PASSWORD: ${REPL_PASSWORD:-}
+      REDIS_PASSWORD: ${REDIS_PASSWORD:-}
+      MQ_PASSWORD: ${MQ_PASSWORD:-}
+      MQ_COOKIE: ${MQ_COOKIE:-}
+    volumes:
+      - secrets-admin:/secrets/admin
+      - secrets-api:/secrets/api
+      - secrets-worker:/secrets/worker
+      - secrets-db:/secrets/db
+      - secrets-redis:/secrets/redis
+      - secrets-rabbit:/secrets/rabbit
+      - secrets-login:/secrets/login
+      - pg-primary:/existing/primary:ro
+      - pg-standby:/existing/standby:ro
+  db-sync:
+    <<: *app
+    command: [/usr/local/bin/init, sync]
+    restart: 'no'
+    volumes: [secrets-db:/run/securedesk:ro]
+    networks: [data]
+    depends_on:
+      pg-primary: {condition: service_healthy}
+      pg-standby: {condition: service_healthy}
+      init: {condition: service_completed_successfully}
+  front:
+    image: nginx:1.28-alpine@sha256:a8b39bd9cf0f83869a2162827a0caf6137ddf759d50a171451b335cecc87d236
+    ports: [127.0.0.1:8080:8080]
+    volumes:
+      - ./web:/usr/share/nginx/html:ro
+      - ./infra/nginx.conf:/etc/nginx/nginx.conf:ro
+    networks:
+      edge: {ipv4_address: 172.29.10.10}
+    depends_on:
+      api: {condition: service_healthy}
+    read_only: true
+    tmpfs: [/var/cache/nginx, /var/run, /tmp]
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    user: '101:101'
+    restart: unless-stopped
+  api-net:
+    build: infra/firewall
+    image: securedesk-firewall:local
+    environment: {ROLE: api}
+    cap_drop: [ALL]
+    cap_add: [NET_ADMIN]
+    networks:
+      edge: {ipv4_address: 172.29.10.20}
+      data: {ipv4_address: 172.29.20.20}
+      cache: {ipv4_address: 172.29.30.20}
+    healthcheck:
+      test: [CMD, test, -f, /tmp/ready]
+      interval: 2s
+      retries: 20
+  api:
+    <<: *app
+    network_mode: service:api-net
+    environment:
+      APP_ORIGIN: http://localhost:8080
+    volumes: [secrets-api:/run/securedesk:ro]
+    depends_on:
+      api-net: {condition: service_healthy}
+      pg-primary: {condition: service_healthy}
+      pg-standby: {condition: service_healthy}
+      redis: {condition: service_healthy}
+      db-sync: {condition: service_completed_successfully}
+    healthcheck:
+      test: [CMD, /usr/local/bin/check, health]
+      interval: 5s
+      timeout: 8s
+      retries: 30
+  worker-net:
+    build: infra/firewall
+    image: securedesk-firewall:local
+    environment: {ROLE: worker}
+    cap_drop: [ALL]
+    cap_add: [NET_ADMIN]
+    networks:
+      data: {ipv4_address: 172.29.20.21}
+      bus: {ipv4_address: 172.29.40.20}
+    healthcheck:
+      test: [CMD, test, -f, /tmp/ready]
+      interval: 2s
+      retries: 20
+  worker:
+    <<: *app
+    command: [/usr/local/bin/worker]
+    network_mode: service:worker-net
+    environment:
+      DB_USER: desk_worker
+    volumes: [secrets-worker:/run/securedesk:ro]
+    depends_on:
+      worker-net: {condition: service_healthy}
+      pg-standby: {condition: service_healthy}
+      rabbit1: {condition: service_healthy}
+      rabbit2: {condition: service_healthy}
+      rabbit3: {condition: service_healthy}
+      db-sync: {condition: service_completed_successfully}
+  tests:
+    profiles: [test]
+    build:
+      context: .
+      target: tests
+    image: securedesk-tests:local
+    network_mode: service:api-net
+    environment:
+      SECUREDESK_INTEGRATION: '1'
+    volumes: [secrets-api:/run/securedesk:ro]
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    read_only: true
+    tmpfs: [/tmp]
+  unit:
+    profiles: [test]
+    build: {context: ., target: build}
+    image: securedesk-build:local
+    network_mode: none
+    command: [go, test, -race, -v, ./...]
+  audit:
+    profiles: [test]
+    build: {context: ., target: build}
+    image: securedesk-build:local
+    network_mode: bridge
+    command: [go, run, golang.org/x/vuln/cmd/govulncheck@v1.9.0, ./...]
+  tools:
+    profiles: [tools]
+    build: {context: ., target: tools}
+    image: securedesk-tools:local
+    environment:
+      PROJECT_NAME: ${COMPOSE_PROJECT_NAME:-securedesk}
+    volumes:
+      - .:/workspace
+      - /var/run/docker.sock:/var/run/docker.sock
+      - secrets-admin:/run/admin:ro
+    networks: [edge]
+  browser:
+    profiles: [test]
+    build: {context: ., dockerfile: infra/browser.Dockerfile}
+    image: securedesk-browser:local
+    network_mode: service:front
+    volumes: [./evidence:/srv/evidence, secrets-login:/run/test-login:ro]
+    read_only: true
+    tmpfs: [/tmp]
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    environment: {HOME: /tmp, TZ: Europe/Moscow}
+  pg-primary:
+    build: db
+    image: securedesk-postgres:local
+    environment:
+      POSTGRES_DB: desk
+      POSTGRES_USER: postgres
+    command: [postgres, -c, wal_level=replica, -c, max_wal_senders=10, -c, wal_keep_size=256MB, -c, wal_log_hints=on]
+    volumes:
+      - pg-primary:/var/lib/postgresql/data
+      - secrets-db:/run/securedesk:ro
+    depends_on:
+      init: {condition: service_completed_successfully}
+    networks:
+      data: {ipv4_address: 172.29.20.10}
+    healthcheck:
+      test: [CMD-SHELL, 'pg_isready -U postgres -d desk']
+      interval: 3s
+      retries: 30
+    restart: 'no'
+  pg-standby:
+    build: db
+    image: securedesk-postgres:local
+    environment:
+      PGDATA: /var/lib/postgresql/data
+    entrypoint: [sh, /securedesk-entrypoint.sh, standby]
+    volumes:
+      - pg-standby:/var/lib/postgresql/data
+      - secrets-db:/run/securedesk:ro
+    networks:
+      data: {ipv4_address: 172.29.20.11}
+    depends_on:
+      pg-primary: {condition: service_healthy}
+      init: {condition: service_completed_successfully}
+    healthcheck:
+      test: [CMD-SHELL, 'pg_isready -U postgres -d desk']
+      interval: 3s
+      retries: 30
+    restart: unless-stopped
+  redis:
+    image: redis:7.4-alpine@sha256:7f7d30b7fdd09467bac58198a1f166dd69789d348d4fe859cccb20e0cf287fbe
+    volumes: [secrets-redis:/run/securedesk:ro]
+    depends_on:
+      init: {condition: service_completed_successfully}
+    command: [sh, -c, 'exec redis-server --requirepass "$$(cat /run/securedesk/REDIS_PASSWORD)" --maxmemory 64mb --maxmemory-policy allkeys-lru --save "" --appendonly no']
+    networks:
+      cache: {ipv4_address: 172.29.30.10}
+    healthcheck:
+      test: [CMD-SHELL, 'REDISCLI_AUTH="$$(cat /run/securedesk/REDIS_PASSWORD)" redis-cli ping | grep PONG']
+      interval: 3s
+      retries: 20
+    restart: unless-stopped
+  rabbit1:
+    <<: *rabbit
+    hostname: rabbit1
+    volumes:
+      - rabbit1:/var/lib/rabbitmq
+      - ./infra/rabbitmq/rabbitmq.conf:/etc/rabbitmq/rabbitmq.conf:ro
+      - ./infra/rabbitmq/entrypoint.sh:/securedesk-rabbit.sh:ro
+      - secrets-rabbit:/run/securedesk:ro
+    networks:
+      bus: {ipv4_address: 172.29.40.11}
+  rabbit2:
+    <<: *rabbit
+    hostname: rabbit2
+    volumes:
+      - rabbit2:/var/lib/rabbitmq
+      - ./infra/rabbitmq/rabbitmq.conf:/etc/rabbitmq/rabbitmq.conf:ro
+      - ./infra/rabbitmq/entrypoint.sh:/securedesk-rabbit.sh:ro
+      - secrets-rabbit:/run/securedesk:ro
+    depends_on:
+      rabbit1: {condition: service_started}
+      init: {condition: service_completed_successfully}
+    networks:
+      bus: {ipv4_address: 172.29.40.12}
+  rabbit3:
+    <<: *rabbit
+    hostname: rabbit3
+    volumes:
+      - rabbit3:/var/lib/rabbitmq
+      - ./infra/rabbitmq/rabbitmq.conf:/etc/rabbitmq/rabbitmq.conf:ro
+      - ./infra/rabbitmq/entrypoint.sh:/securedesk-rabbit.sh:ro
+      - secrets-rabbit:/run/securedesk:ro
+    depends_on:
+      rabbit2: {condition: service_started}
+      init: {condition: service_completed_successfully}
+    networks:
+      bus: {ipv4_address: 172.29.40.13}
+networks:
+  edge:
+    ipam: {config: [{subnet: 172.29.10.0/24}]}
+  data:
+    internal: true
+    ipam: {config: [{subnet: 172.29.20.0/24}]}
+  cache:
+    internal: true
+    ipam: {config: [{subnet: 172.29.30.0/24}]}
+  bus:
+    internal: true
+    ipam: {config: [{subnet: 172.29.40.0/24}]}
+volumes:
+  secrets-admin:
+  secrets-api:
+  secrets-worker:
+  secrets-db:
+  secrets-redis:
+  secrets-rabbit:
+  secrets-login:
+  pg-primary:
+  pg-standby:
+  rabbit1:
+  rabbit2:
+  rabbit3:
